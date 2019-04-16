@@ -14,7 +14,7 @@
 #include <rho/rho.h>
 #include <rpc.h>
 
-#include "tcad.h"
+#include <tcad.h>
 
 /**************************************
  * tcadserver -- trusted (incrementing)

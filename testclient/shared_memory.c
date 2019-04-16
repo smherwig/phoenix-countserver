@@ -43,16 +43,28 @@ struct tl {
     int turn;
 };
 
-struct secmem {
+struct segment {
     char    *path;
     size_t  size;
     void    *file_mem;
     void    *priv_mem;
-    struct  tl *tl;
     uint8_t iv[IV_SIZE];
     uint8_t key[32];
     uint8_t tag[16];
 };
+
+
+struct tcad_client {
+    struct rpc_agent   *cli_agent;
+};
+
+
+struct secmem {
+    struct tcad_client *client; 
+    struct segment *segment;
+    struct tl *tl;
+};
+
 
 /******************************************
  * TIMER
@@ -95,7 +107,6 @@ encrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
     br_gcm_flip(&gc);
     br_gcm_run(&gc, 1, data, data_len); /* encrypts in-place */
     br_gcm_get_tag(&gc, tag);
-
 }
 
 /* decrypt fd to priv_mem */
@@ -113,6 +124,135 @@ decrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
     br_gcm_flip(&gc);
     br_gcm_run(&gc, 0, data, data_len); /* encrypts in-place */
     br_gcm_get_tag(&gc, tag);
+}
+
+/******************************************
+ * TCAD Client
+ ******************************************/
+
+static struct tcad_client *
+tcad_connect(const char *url)
+{
+    struct tcad_client *client = NULL;
+    struct rho_sock *sock = NULL;
+
+    RHO_TRACE_ENTER("url=\"%s\"", url);
+
+    sock = rho_sock_from_url(url);
+    rho_sock_connect_url(sock, url);
+
+    client = rhoL_zalloc(sizeof(*client));
+    client->cli_agent = rpc_agent_create(sock, NULL);
+
+    RHO_TRACE_EXIT();
+    return (client);
+}
+
+static int
+tcad_create_entry(struct tcad_client *client, const char *name, void *data,
+        size_t data_len)
+{
+    struct rpc_agent *agent = client->cli_agent;
+    struct rho_buf *buf = agent->ra_bodybuf;
+    struct rpc_hdr *hdr = &agent->ra_hdr;
+
+    RHO_TRACE_ENTER();
+
+    /* build request */
+    rpc_agent_new_msg(agent, TCAD_OP_CREATE_ENTRY);
+    rho_buf_write_u32size_str(buf, purl->path);
+    rho_buf_write_u32size_blob(buf, data, data_len);
+    rpc_agent_autoset_bodylen(agent);
+
+    /* make request */
+    error = rpc_agent_request(agent);
+    if (error != 0) {
+        /* RPC/transport error */
+        goto done;
+    }
+
+    if (hdr->rh_code != 0) {
+        /* method error */
+        goto done;
+    }
+
+    /* body is initial counter value (0) */
+
+    RHO_TRACE_EXIT();
+}
+
+static int
+tcad_cmp_and_get(struct tcad_client *client, const char *name,
+        int expected_count, void *data, size_t &data_len)
+{
+    struct rpc_agent *agent = client->cli_agent;
+    struct rho_buf *buf = agent->ra_bodybuf;
+    struct rpc_hdr *hdr = &agent->ra_hdr;
+
+    RHO_TRACE_ENTER();
+
+    /* build request */
+    rpc_agent_new_msg(agent, TCAD_OP_CMP_AND_GET);
+    rho_buf_write_u32size_str(buf, purl->path);
+    rho_buf_write32be(buf, expected_count); 
+    rpc_agent_autoset_bodylen(agent);
+
+    /* make request */
+    error = rpc_agent_request(agent);
+    if (error != 0) {
+        /* RPC/transport error */
+        goto done;
+    }
+
+    if (hdr->rh_code != 0) {
+        /* method error */
+        goto done;
+    }
+
+    rho_buf_read_u32size_blob(buf, data, 256, &tlen);
+
+    RHO_TRACE_EXIT();
+}
+
+static int
+tcad_inc_and_set(struct tcad_client *client, const char *name, void *data,
+        size_t data_len)
+{
+    struct rpc_agent *agent = client->cli_agent;
+    struct rho_buf *buf = agent->ra_bodybuf;
+    struct rpc_hdr *hdr = &agent->ra_hdr;
+
+    RHO_TRACE_ENTER();
+
+    /* build request */
+    rpc_agent_new_msg(agent, TCAD_OP_INC_AND_SET);
+    rho_buf_write_u32size_str(buf, purl->path);
+    rho_buf_write_u32size_blob(buf, data, data_len);
+    rpc_agent_autoset_bodylen(agent);
+
+    /* make request */
+    error = rpc_agent_request(agent);
+    if (error != 0) {
+        /* RPC/transport error */
+        goto done;
+    }
+
+    if (hdr->rh_code != 0) {
+        /* method error */
+        goto done;
+    }
+
+    /* no body */
+
+    RHO_TRACE_EXIT();
+}
+
+static int
+tcad_disconnect(struct tcad_client *client)
+{
+    RHO_TRACE_ENTER();
+
+    RHO_TRACE_EXIT();
 }
 
 /******************************************
@@ -162,18 +302,15 @@ tl_unlock(struct tl *tl)
 }
 
 /******************************************
- * Secure Memory API
- * (shmcrypt)
- *
- * The tl is in untrusted memory.
- * The key is in trusted memory.
- * ******************************************/
-static struct secmem *
-secmem_create(const char *path, size_t size)
+ * SEGMENT
+ ******************************************/
+
+static struct segment *
+segment_create(const char *path, size_t size)
 {
     int error = 0;
     int fd = 0;
-    struct secmem *sm = NULL;
+    struct segment *seg = NULL;
 
     fd = open(path, O_RDWR|O_CREAT|O_EXCL, S_IRUSR |S_IWUSR |S_IRGRP|S_IWGRP);
     if (fd == -1)
@@ -183,55 +320,61 @@ secmem_create(const char *path, size_t size)
     if (error == -1)
         rho_errno_die(errno, "fdtruncate(\"%s\", %zu)", path, size);
 
-    sm = rhoL_zalloc(sizeof(*sm));
+    seg = rhoL_zalloc(sizeof(*seg));
 
-    sm->file_mem =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+    seg->file_mem =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
             fd, 0);    
-    if (sm->file_mem == NULL)
+    if (seg->file_mem == NULL)
         rho_errno_die(errno, "mmap");
 
     close(fd);
 
-    sm->size = size;
-    sm->priv_mem = rhoL_zalloc(size);
-    sm->tl = tl_create();
-    memcpy(sm->key, default_key, 32);
-    sm->path = rhoL_strdup(path);
+    seg->size = size;
+    seg->priv_mem = rhoL_zalloc(size);
+    seg->tl = tl_create();
+    memcpy(seg->key, default_key, 32);
+    seg->path = rhoL_strdup(path);
 
-    return (sm);
+    return (seg);
 }
 
 static void
-secmem_destroy(struct secmem *sm)
+segment_destroy(struct segment *seg)
 {
     int error = 0;
 
-    rhoL_free(sm->priv_mem);
-    error = munmap(sm->file_mem, sm->size);
+    rhoL_free(seg->priv_mem);
+    error = munmap(seg->file_mem, seg->size);
     if (error == -1)
         rho_errno_warn(errno, "munmap");
-    rhoL_free(sm->path);
-    tl_destroy(sm->tl);
+    rhoL_free(seg->path);
+    tl_destroy(seg->tl);
 
-    rhoL_free(sm);
+    rhoL_free(seg);
 }
 
 /* decrypt file into private memory */
 static void
-secmem_map_in(struct secmem *sm)
+segment_map_in(struct segment *seg, uint8_t *trusted_tag)
 {
-    memcpy(sm->priv_mem, sm->file_mem, sm->size);
-    decrypt(sm->priv_mem, sm->size, sm->key, sm->iv, sm->tag);
+    memcpy(seg->priv_mem, seg->file_mem, seg->size);
+    decrypt(seg->priv_mem, seg->size, seg->key, seg->iv, seg->tag);
+
+    /* TODO: chck that seg->tag == trusted_tag */
 }
 
 /* encrypt private memory to file */
 static void
-secmem_map_out(struct secmem *sm)
+segment_map_out(struct segment *seg)
 {
-    rho_rand_bytes(sm->iv, IV_SIZE);
-    encrypt(sm->priv_mem, sm->size, sm->key, sm->iv, sm->tag);
-    memcpy(sm->file_mem, sm->priv_mem, sm->size);
+    rho_rand_bytes(seg->iv, IV_SIZE);
+    encrypt(seg->priv_mem, seg->size, seg->key, seg->iv, seg->tag);
+    memcpy(seg->file_mem, seg->priv_mem, seg->size);
 }
+
+/******************************************
+ * SECMEM
+ ******************************************/
 
 static void
 secmem_lock(struct secmem *sm)
@@ -239,10 +382,14 @@ secmem_lock(struct secmem *sm)
     TIMER_DECL(timer);
 
     tl_lock(sm->tl);
+timer_start(&timer);
+    tcad_cmp_and_get(sm->client, sm->path, sm->tl->turn, data, &data_len);
 
-    timer_start(&timer);
-    secmem_map_in(sm);
-    timer_stop(&timer);
+    /* TODO: parse out data: (iv, tag) */
+
+    segment_map_in(sm->segment, tag);
+
+timer_stop(&timer);
     fprintf(stderr, "time for map in: %f secs\n", timer_get_elapsed(&timer));
 }
 
@@ -251,9 +398,13 @@ secmem_unlock(struct secmem *sm)
 { 
     TIMER_DECL(timer);
 
-    timer_start(&timer);
-    secmem_map_out(sm);
-    timer_stop(&timer);
+timer_start(&timer);
+    segment_map_out(sm->segment);
+
+    /* TODO: concatenate IV and tag into buffer */
+    tcad_inc_and_set(sm->client, sm->path, data, data_len);
+
+timer_stop(&timer);
     fprintf(stderr, "time for map out: %f secs\n", timer_get_elapsed(&timer));
 
     tl_unlock(sm->tl);
@@ -262,53 +413,19 @@ secmem_unlock(struct secmem *sm)
 /******************************************
  * Example Program
  ******************************************/
-
-static void
-random_sleep(void)
-{
-    int r = 0;
-
-    r = rand() / 10000;
-    usleep(r);
-}
-
-static void
-child(struct secmem *sm)
-{
-    int i = 0 ;
-
-    for (i = 0; i < ITERATIONS; i++) {
-        secmem_lock(sm);
-        rho_hexdump(sm->priv_mem, 16, "child priv_mem on lock (i=%d)", i);
-        memcpy(sm->priv_mem, "BBBBBBBBBBBBBBBB", 16);
-        secmem_unlock(sm);
-        //rho_hexdump(sm->priv_mem, 16, "child priv_mem on unlock (i=%d)", i);
-        random_sleep();
-    }
-
-    secmem_destroy(sm);
-}
-
 int
 main(int argc, char *argv[])
 {
     int i = 0;
     pid_t pid = 0;
     struct secmem *sm = NULL;
+    struct tcad_client *client = NULL;
+
 
     (void)argc;
-    (void)argv;
+    client = tcad_connect(argv[1]);
 
-    sm = secmem_create("/tmp/secmem.test", 16);
-
-    pid = fork();
-    if (pid == -1)
-        rho_errno_die(errno, "fork");
-
-    if (pid == 0) {
-        child(sm);
-        exit(0);
-    }
+    tcad_create_entry(client, "foo", "bar", 3);
 
     for (i = 0; i < ITERATIONS; i++) {
         secmem_lock(sm);

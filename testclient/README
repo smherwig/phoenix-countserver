@@ -1,4 +1,4 @@
-The testclient is an mock, example implementation of a secure shared memory
+The testclient is a mock, example implementation of a secure shared memory
 protocol for use with Intel SGX.
 
 The protocol assumes a Byzantine threat model with regards to the untrusted
@@ -9,21 +9,20 @@ The implementation represents shared memory as an untrusted memory
 mapping.  We call this the public replica.  Each process additionally keeps a
 private, shadow mapping, in trusted memory (the process's private replica).
 
-The public replica is always encrypted using authenticated encryption.
-In this implementation, we use BearSSL's implementaiton of the AES-GCM stream
-cipher with AES-NI hardware extensions.
+The public replica is always encrypted using authenticated encryption.  In this
+implementation, we use BearSSL's implementation of the AES-GCM stream cipher
+with AES-NI hardware extensions.
 
 When a process creates a new shared memory segment, the process assigns a
 unique name to the segment, and associates the segment with a lock.  In our
 implementation, we implement a ticket-lock scheme.  Recall that a ticket-lock
 mimics a deli "take-a-ticket" setup.  That is, the ticket-lock consists of two
 integers: the current ticket number, and the current turn number.  When a
-client attempts a lock, they fetch and increment the ticket number; this
+client attempts to lock, they fetch and increment the ticket number; this
 becomes their turn.  The client then waits until the current ticket turn equals
 their turn.  When a client unlocks, they increment the current turn number.
 
-The setup looks like:
-
+In regards to memory, the setup is:
 
     host (untrusted memory):
         ticket_number
@@ -34,20 +33,15 @@ The setup looks like:
         priv_mem
 
     tcadserver (trusted memory):
-        name => {turn, iv tag}
+        name => {turn, key, iv tag}
     
 
 That is, pub_mem is the public replica, priv_mem the shadowed, private replica.
-The tcadserver maps the segment naem to the trusted turn, iv, and MAC tag.
+The tcadserver maps the segment name to the trusted turn, key, iv, and MAC tag.
 
 The system has four basic operations: create a memory segment, lock a segment,
-unlock a segment, and destory a segment:
-
-# For now, assume process only has one segment:
-# Also note that if you have an honest-but-curious model (and thus assume
-# the integrity of untrusted memory), you do the same algorithm, but
-with aes_ctr and without the tcadserver.  In this case, the IV would also
-be stored in untrusted memory.
+unlock a segment, and destroy a segment.  In the example pseudo code below,
+we assume that a process has at most one segment.
 
 process:
     turn = 0
@@ -78,20 +72,20 @@ process:
 
         error, data = tcadserver.cmp_and_get(path, turn)
         if error == SUCCESS:
-            iv, tag = unpack(data)
+            key, iv, tag = unpack(data)
         else:
-            bad()
+            tampering!()
 
         aes_gcm_decrypt(pub_mem, priv_mem, key, iv, actual_tag)
         if actual_tag != tag:
-            bad()
+            tampering!()
 
     def unlock:
         iv = rand()
         aes_gcm_encrypt(priv_mem, pub_mem, key, iv, tag)
         data = pack(key, iv, tag)
         tcadserver.inc_and_set(path, data)
-        pub_lock.turn += 1
+        pub_lock.turn += 1                                  *****
 
 tcadserver:
     # name => (counter, data)
@@ -108,12 +102,30 @@ tcadserver:
         else:
             return FAILURE
 
-    def inc_and_set(path, data, expected_counter):
+    def inc_and_set(path, new_data):
         counter, data = mapping.get(path)
-        if counter == expected_counter:
-            return (SUCCESS, data)
-        else:
-            return FAILURE
+        mapping[path] = (counter, new_data)
+        return SUCCESS
 
     def destroy:
         pass
+
+The lines with '*****' are the operations where the untrusted host could lie.
+The untrusted host can of course deny service by, for instance, returning a
+past turn (and thus have the client spin forever).  The tcadserver guarantees
+that if the host acquire the lock, the turn number matches the trusted
+(monotonically increasing) turn number.  The spin loop in the lock() function
+could also be augmenting to retrived the trusted counter after so many
+iterations to ensure that the client's turn is legit (that is, not less than
+the trusted counter).  
+
+Additionally, there is likely an optimization that involves implementing the
+ticket-lock with futexes, so as to avoid long spin loops.
+
+If you have an honest-but-curious model (and thus assume the integrity of
+untrusted memory), you would do the same algorithm with the following
+changes:
+
+    1. use aes_ctr instead of aes_gcm
+    2. remove the tcadserver
+    3. store the IV in untrusted memory

@@ -3,6 +3,8 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+#define _BSD_SOURCE
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -13,11 +15,20 @@
 #include <unistd.h>
 
 #include <rho/rho.h>
+#include <rpc.h>
 
 #include <bearssl/bearssl.h>
 
+#include <tcad.h>
+
+
 #define ITERATIONS 10
+
+#define COUNTER_SIZE 4
 #define IV_SIZE 12
+#define TAG_SIZE 16
+
+#define AD_SIZE (COUNTER_SIZE + IV_SIZE + TAG_SIZE)
 
 static uint8_t default_key[] = {
     0x41, 0x42, 0x43, 0x44,
@@ -39,18 +50,21 @@ struct timer {
     struct timer name = { 0, 0 }
 
 struct tl {
-    int ticket_number;
-    int turn;
+    int ticket_number;      /* untrusted */
+    int turn;               /* untrusted/trusted/server */
 };
 
 struct segment {
-    char    *path;
+    /* use the convention of having a path for the name,
+     * even though the pathname structure carries no meaning
+     */
+    char    *name;          
     size_t  size;
-    void    *file_mem;
-    void    *priv_mem;
-    uint8_t iv[IV_SIZE];
-    uint8_t key[32];
-    uint8_t tag[16];
+    void    *pub_mem;       /* untrusted */
+    void    *priv_mem;      /* trusted */
+    uint8_t iv[IV_SIZE];    /* trusted/server */
+    uint8_t key[32];        /* trusted/server */
+    uint8_t tag[16];        /* trusted/server */
 };
 
 
@@ -58,13 +72,11 @@ struct tcad_client {
     struct rpc_agent   *cli_agent;
 };
 
-
 struct secmem {
     struct tcad_client *client; 
     struct segment *segment;
     struct tl *tl;
 };
-
 
 /******************************************
  * TIMER
@@ -86,6 +98,18 @@ static inline double
 timer_get_elapsed(struct timer *timer)
 {
     return ((double)(timer->stop - timer->start) / CLOCKS_PER_SEC);
+}
+
+/******************************************
+ * MISC
+ ******************************************/
+static void
+random_sleep(void)
+{
+    int r = 0;
+
+    r = rand() / 10000;
+    usleep(r);
 }
 
 /******************************************
@@ -152,6 +176,7 @@ static int
 tcad_create_entry(struct tcad_client *client, const char *name, void *data,
         size_t data_len)
 {
+    int error = 0;
     struct rpc_agent *agent = client->cli_agent;
     struct rho_buf *buf = agent->ra_bodybuf;
     struct rpc_hdr *hdr = &agent->ra_hdr;
@@ -160,7 +185,7 @@ tcad_create_entry(struct tcad_client *client, const char *name, void *data,
 
     /* build request */
     rpc_agent_new_msg(agent, TCAD_OP_CREATE_ENTRY);
-    rho_buf_write_u32size_str(buf, purl->path);
+    rho_buf_write_u32size_str(buf, name);
     rho_buf_write_u32size_blob(buf, data, data_len);
     rpc_agent_autoset_bodylen(agent);
 
@@ -178,13 +203,16 @@ tcad_create_entry(struct tcad_client *client, const char *name, void *data,
 
     /* body is initial counter value (0) */
 
+done:
     RHO_TRACE_EXIT();
+    return (error);
 }
 
 static int
 tcad_cmp_and_get(struct tcad_client *client, const char *name,
-        int expected_count, void *data, size_t &data_len)
+        int expected_count, void *data, size_t *data_len)
 {
+    int error = 0;
     struct rpc_agent *agent = client->cli_agent;
     struct rho_buf *buf = agent->ra_bodybuf;
     struct rpc_hdr *hdr = &agent->ra_hdr;
@@ -193,7 +221,7 @@ tcad_cmp_and_get(struct tcad_client *client, const char *name,
 
     /* build request */
     rpc_agent_new_msg(agent, TCAD_OP_CMP_AND_GET);
-    rho_buf_write_u32size_str(buf, purl->path);
+    rho_buf_write_u32size_str(buf, name);
     rho_buf_write32be(buf, expected_count); 
     rpc_agent_autoset_bodylen(agent);
 
@@ -209,15 +237,18 @@ tcad_cmp_and_get(struct tcad_client *client, const char *name,
         goto done;
     }
 
-    rho_buf_read_u32size_blob(buf, data, 256, &tlen);
+    rho_buf_read_u32size_blob(buf, data, 256, data_len);
 
+done:
     RHO_TRACE_EXIT();
+    return (error);
 }
 
 static int
 tcad_inc_and_set(struct tcad_client *client, const char *name, void *data,
         size_t data_len)
 {
+    int error = 0;
     struct rpc_agent *agent = client->cli_agent;
     struct rho_buf *buf = agent->ra_bodybuf;
     struct rpc_hdr *hdr = &agent->ra_hdr;
@@ -226,7 +257,7 @@ tcad_inc_and_set(struct tcad_client *client, const char *name, void *data,
 
     /* build request */
     rpc_agent_new_msg(agent, TCAD_OP_INC_AND_SET);
-    rho_buf_write_u32size_str(buf, purl->path);
+    rho_buf_write_u32size_str(buf, name);
     rho_buf_write_u32size_blob(buf, data, data_len);
     rpc_agent_autoset_bodylen(agent);
 
@@ -244,16 +275,21 @@ tcad_inc_and_set(struct tcad_client *client, const char *name, void *data,
 
     /* no body */
 
+done:
     RHO_TRACE_EXIT();
+    return (error);
 }
 
+#if 0
 static int
 tcad_disconnect(struct tcad_client *client)
 {
     RHO_TRACE_ENTER();
-
+    (void)client;
     RHO_TRACE_EXIT();
+    return (0);
 }
+#endif
 
 /******************************************
  * Ticket-Lock
@@ -265,8 +301,8 @@ tl_create(void)
     struct tl *tl = NULL;
 
     /* this memory will be untrusted */
-    tl = mmap(NULL, sizeof(struct tl), PROT_READ | PROT_WRITE,
-        MAP_ANONYMOUS | MAP_SHARED, -1, 0);    
+    tl = mmap(NULL, sizeof(struct tl), PROT_READ|PROT_WRITE,
+        MAP_ANONYMOUS|MAP_SHARED, -1, 0);    
     if (tl == NULL)
         rho_errno_die(errno, "mmap");
 
@@ -276,6 +312,7 @@ tl_create(void)
     return (tl);
 }
 
+#if 0
 static void
 tl_destroy(struct tl *tl)
 {
@@ -285,6 +322,7 @@ tl_destroy(struct tl *tl)
     if (error == -1)
         rho_errno_warn(errno, "munmap");
 }
+#endif
 
 static void
 tl_lock(struct tl *tl)
@@ -306,61 +344,61 @@ tl_unlock(struct tl *tl)
  ******************************************/
 
 static struct segment *
-segment_create(const char *path, size_t size)
+segment_create(const char *name, size_t size)
 {
-    int error = 0;
-    int fd = 0;
     struct segment *seg = NULL;
-
-    fd = open(path, O_RDWR|O_CREAT|O_EXCL, S_IRUSR |S_IWUSR |S_IRGRP|S_IWGRP);
-    if (fd == -1)
-        rho_errno_die(errno, "open(\"%s\")", path);
-    
-    error = ftruncate(fd, size);
-    if (error == -1)
-        rho_errno_die(errno, "fdtruncate(\"%s\", %zu)", path, size);
 
     seg = rhoL_zalloc(sizeof(*seg));
 
-    seg->file_mem =  mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
-            fd, 0);    
-    if (seg->file_mem == NULL)
+    seg->name = rhoL_strdup(name);
+    seg->size = size;
+
+    seg->pub_mem =  mmap(NULL, size, PROT_READ|PROT_WRITE, 
+            MAP_ANONYMOUS|MAP_SHARED, -1, 0);    
+    if (seg->pub_mem == NULL)
         rho_errno_die(errno, "mmap");
 
-    close(fd);
+    seg->priv_mem = mmap(NULL, size, PROT_READ|PROT_WRITE,
+            MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
 
-    seg->size = size;
-    seg->priv_mem = rhoL_zalloc(size);
-    seg->tl = tl_create();
+    rho_rand_bytes(seg->iv, IV_SIZE);
     memcpy(seg->key, default_key, 32);
-    seg->path = rhoL_strdup(path);
 
     return (seg);
 }
 
+#if 0
 static void
 segment_destroy(struct segment *seg)
 {
     int error = 0;
 
-    rhoL_free(seg->priv_mem);
-    error = munmap(seg->file_mem, seg->size);
+    rhoL_free(seg->name);
+
+    error = munmap(seg->pub_mem, seg->size);
     if (error == -1)
         rho_errno_warn(errno, "munmap");
-    rhoL_free(seg->path);
-    tl_destroy(seg->tl);
+
+    error = munmap(seg->priv_mem, seg->size);
+    if (error == -1)
+        rho_errno_warn(errno, "munmap");
 
     rhoL_free(seg);
 }
+#endif
 
 /* decrypt file into private memory */
 static void
-segment_map_in(struct segment *seg, uint8_t *trusted_tag)
+segment_map_in(struct segment *seg)
 {
-    memcpy(seg->priv_mem, seg->file_mem, seg->size);
-    decrypt(seg->priv_mem, seg->size, seg->key, seg->iv, seg->tag);
+    uint8_t actual_tag[TAG_SIZE] = {0};
 
-    /* TODO: chck that seg->tag == trusted_tag */
+    memcpy(seg->priv_mem, seg->pub_mem, seg->size);
+    decrypt(seg->priv_mem, seg->size, seg->key, seg->iv, actual_tag);
+
+    if (!rho_mem_equal(seg->tag, actual_tag, TAG_SIZE))
+        rho_warn("on segment \"%s\"map in, tag does not match trusted tag",
+                seg->name);
 }
 
 /* encrypt private memory to file */
@@ -369,25 +407,82 @@ segment_map_out(struct segment *seg)
 {
     rho_rand_bytes(seg->iv, IV_SIZE);
     encrypt(seg->priv_mem, seg->size, seg->key, seg->iv, seg->tag);
-    memcpy(seg->file_mem, seg->priv_mem, seg->size);
+    memcpy(seg->pub_mem, seg->priv_mem, seg->size);
+}
+
+
+/******************************************
+ * SERIALIZE/DESERIALIZE HELPERS
+ ******************************************/
+static void
+ad_pack(int turn, void *iv, void *tag, void *ad)
+{
+    int32_t turn_be;
+
+    turn_be = htobe32(turn);
+    memcpy(ad, &turn_be, sizeof(turn_be));
+    memcpy(ad + sizeof(turn_be), iv, IV_SIZE);
+    memcpy(ad + sizeof(turn_be) + IV_SIZE, tag, TAG_SIZE);
+}
+
+static void
+ad_unpack(const void *ad, int *turn, void *iv, void *tag)
+{
+    int8_t turn_be = 0;
+
+    turn_be = *((int32_t *)ad);
+    *turn = be32toh(turn_be);
+    memcpy(iv,ad + sizeof(turn_be), IV_SIZE);
+    memcpy(tag, ad + sizeof(turn_be) + IV_SIZE, TAG_SIZE);
 }
 
 /******************************************
  * SECMEM
  ******************************************/
+struct secmem *
+secmem_create(const char *url)
+{
+    struct secmem *sm = NULL;
+
+    sm = rhoL_zalloc(sizeof(*sm));
+    sm->tl = tl_create();
+    sm->client = tcad_connect(url);
+
+    return (sm);
+}
+
+static void
+secmem_create_segment(struct secmem *sm, const char *name, size_t size)
+{
+    uint8_t ad[AD_SIZE] = {0};
+
+    sm->segment = segment_create(name, size);
+    ad_pack(sm->tl->turn, sm->segment->iv, sm->segment->tag, ad);
+    tcad_create_entry(sm->client, sm->segment->name, ad, AD_SIZE); 
+}
 
 static void
 secmem_lock(struct secmem *sm)
 {
+    uint8_t ad[AD_SIZE] = {0};
+    size_t ad_size = 0;
+    int ret_turn = 0;
+    uint8_t ret_iv[IV_SIZE] = {0};
+    uint8_t ret_tag[TAG_SIZE] = {0};
+
     TIMER_DECL(timer);
 
     tl_lock(sm->tl);
+
 timer_start(&timer);
-    tcad_cmp_and_get(sm->client, sm->path, sm->tl->turn, data, &data_len);
 
-    /* TODO: parse out data: (iv, tag) */
+    tcad_cmp_and_get(sm->client, sm->segment->name, sm->tl->turn, ad, &ad_size);
+    ad_unpack(ad, &ret_turn, ret_iv, ret_tag);
 
-    segment_map_in(sm->segment, tag);
+    memcpy(sm->segment->iv, ret_iv, IV_SIZE);
+    memcpy(sm->segment->tag, ret_tag, TAG_SIZE);
+
+    segment_map_in(sm->segment);
 
 timer_stop(&timer);
     fprintf(stderr, "time for map in: %f secs\n", timer_get_elapsed(&timer));
@@ -396,13 +491,14 @@ timer_stop(&timer);
 static void
 secmem_unlock(struct secmem *sm)
 { 
+    uint8_t ad[AD_SIZE] = {0};
     TIMER_DECL(timer);
 
 timer_start(&timer);
     segment_map_out(sm->segment);
 
-    /* TODO: concatenate IV and tag into buffer */
-    tcad_inc_and_set(sm->client, sm->path, data, data_len);
+    ad_pack(sm->tl->turn, sm->segment->iv, sm->segment->tag, ad);
+    tcad_inc_and_set(sm->client, sm->segment->name, ad, AD_SIZE);
 
 timer_stop(&timer);
     fprintf(stderr, "time for map out: %f secs\n", timer_get_elapsed(&timer));
@@ -410,34 +506,41 @@ timer_stop(&timer);
     tl_unlock(sm->tl);
 }
 
+static void
+usage(int exit_code)
+{
+    fprintf(stderr, "tcadclient SERVER_URL SEGMENT_NAME\n");
+    exit(exit_code);
+}
+
 /******************************************
  * Example Program
+ *
+ * argv[1] = server url
+ * argv[2] = name of segment to create
  ******************************************/
 int
 main(int argc, char *argv[])
 {
-    int i = 0;
-    pid_t pid = 0;
     struct secmem *sm = NULL;
-    struct tcad_client *client = NULL;
+    int i = 0;
 
+    if (argc != 3)
+        usage(1);
 
-    (void)argc;
-    client = tcad_connect(argv[1]);
-
-    tcad_create_entry(client, "foo", "bar", 3);
+    sm = secmem_create(argv[1]);
+    secmem_create_segment(sm, argv[2], 4096);
 
     for (i = 0; i < ITERATIONS; i++) {
         secmem_lock(sm);
-        rho_hexdump(sm->priv_mem, 16, "parent priv_mem on lock (i=%d)", i);
-        memcpy(sm->priv_mem + 8, "AAAAAAAA", 8);
+        rho_hexdump(sm->segment->priv_mem, 16, "parent priv_mem on lock (i=%d)", i);
+        memcpy(sm->segment->priv_mem + 8, "AAAAAAAA", 8);
         secmem_unlock(sm);
         //rho_hexdump(sm->priv_mem, 16, "parent priv_mem on unlock (i=%d)", i);
         random_sleep();
     }
 
-    secmem_destroy(sm);
-    wait(NULL);
+    //secmem_destroy(sm);
 
     return (0);
 }

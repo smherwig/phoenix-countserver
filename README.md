@@ -1,2 +1,5 @@
 # phoenix-countserver
-Trusted monotonic counter with associated data server for the Phoenix SGX-microkernel
+
+Trusted monotonic counter with associated data server for the Phoenix
+SGX-microkernel.
+

@@ -1,0 +1,119 @@
+The testclient is an mock, example implementation of a secure shared memory
+protocol for use with Intel SGX.
+
+The protocol assumes a Byzantine threat model with regards to the untrusted
+host.  In particular, we cannot trust the integrity of any untrusted memory,
+and must maintain the confidentiality of the shared memory contents.
+
+The implementation represents shared memory as an untrusted memory
+mapping.  We call this the public replica.  Each process additionally keeps a
+private, shadow mapping, in trusted memory (the process's private replica).
+
+The public replica is always encrypted using authenticated encryption.
+In this implementation, we use BearSSL's implementaiton of the AES-GCM stream
+cipher with AES-NI hardware extensions.
+
+When a process creates a new shared memory segment, the process assigns a
+unique name to the segment, and associates the segment with a lock.  In our
+implementation, we implement a ticket-lock scheme.  Recall that a ticket-lock
+mimics a deli "take-a-ticket" setup.  That is, the ticket-lock consists of two
+integers: the current ticket number, and the current turn number.  When a
+client attempts a lock, they fetch and increment the ticket number; this
+becomes their turn.  The client then waits until the current ticket turn equals
+their turn.  When a client unlocks, they increment the current turn number.
+
+The setup looks like:
+
+
+    host (untrusted memory):
+        ticket_number
+        turn
+        pub_mem
+
+    process (trusted memory):
+        priv_mem
+
+    tcadserver (trusted memory):
+        name => {turn, iv tag}
+    
+
+That is, pub_mem is the public replica, priv_mem the shadowed, private replica.
+The tcadserver maps the segment naem to the trusted turn, iv, and MAC tag.
+
+The system has four basic operations: create a memory segment, lock a segment,
+unlock a segment, and destory a segment:
+
+# For now, assume process only has one segment:
+# Also note that if you have an honest-but-curious model (and thus assume
+# the integrity of untrusted memory), you do the same algorithm, but
+with aes_ctr and without the tcadserver.  In this case, the IV would also
+be stored in untrusted memory.
+
+process:
+    turn = 0
+    name
+    priv_mem
+    pub_lock
+    pub_mem
+    key
+    iv
+    tag
+
+    def create(name, size):
+        name = name
+        size = size
+        pub_lock = mmap(2 * sizeof(int) MAP_SHARED|MAP_ANONYMOUS)
+        pub_mem = mmap(size, MAP_SHARED|MAP_ANONYMOUS)
+        priv_mem = mmap(size, MAP_PRIVATE|MAP_ANONYMOUS)
+        key = rand()
+        iv = rand()
+        aes_gcm_encrypt(pub_me, priv_mem, key, iv, tag)
+        data = key + iv + tag
+        tcadserver.create_entry(path, data)
+
+    def lock:
+        turn = atomic_fetch_inc(pub_lock.ticket_number)     *****
+        while turn != pub_lock.turn:
+            continue
+
+        error, data = tcadserver.cmp_and_get(path, turn)
+        if error == SUCCESS:
+            iv, tag = unpack(data)
+        else:
+            bad()
+
+        aes_gcm_decrypt(pub_mem, priv_mem, key, iv, actual_tag)
+        if actual_tag != tag:
+            bad()
+
+    def unlock:
+        iv = rand()
+        aes_gcm_encrypt(priv_mem, pub_mem, key, iv, tag)
+        data = pack(key, iv, tag)
+        tcadserver.inc_and_set(path, turn, data)
+        pub_lock.turn += 1
+
+tcadserver:
+    # name => (counter, data)
+    mapping = {}
+
+    def create_entry(path, data):
+        mapping[path] = (0, data)
+        return SUCCESS
+
+    def cmp_and_get(path, s_counter):
+        counter, data = mapping[path]
+        if counter == s_counter:
+            return (SUCCESS, data)
+        else:
+            return FAILURE
+
+    def inc_and_set(path, data, expected_counter):
+        counter, data = mapping.get(path)
+        if counter == expected_counter:
+            return (SUCCESS, data)
+        else:
+            return FAILURE
+
+    def destroy:
+        pass

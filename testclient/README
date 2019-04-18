@@ -90,7 +90,7 @@ process:
         iv = rand()
         aes_gcm_encrypt(priv_mem, pub_mem, key, iv, tag)
         data = pack(key, iv, tag)
-        tcadserver.inc_and_set(path, turn, data)
+        tcadserver.inc_and_set(path, data)
         pub_lock.turn += 1
 
 tcadserver:

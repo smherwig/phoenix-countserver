@@ -25,10 +25,16 @@
 #define ITERATIONS 10
 
 #define COUNTER_SIZE 4
+#define KEY_SIZE 16
 #define IV_SIZE 12
 #define TAG_SIZE 16
 
-#define AD_SIZE (COUNTER_SIZE + IV_SIZE + TAG_SIZE)
+#define AD_SIZE (COUNTER_SIZE + KEY_SIZE + IV_SIZE + TAG_SIZE)
+
+#define AD_COUNTER_POS  0
+#define AD_KEY_POS      COUNTER_SIZE
+#define AD_IV_POS       AD_KEY_POS + KEY_SIZE
+#define AD_TAG_POS      AD_IV_POS + IV_SIZE
 
 static uint8_t default_key[] = {
     0x41, 0x42, 0x43, 0x44,
@@ -65,6 +71,8 @@ struct segment {
     uint8_t iv[IV_SIZE];    /* trusted/server */
     uint8_t key[32];        /* trusted/server */
     uint8_t tag[16];        /* trusted/server */
+    struct tl *tl;          /* untrusted */
+    int     turn;
 };
 
 
@@ -75,7 +83,6 @@ struct tcad_client {
 struct secmem {
     struct tcad_client *client; 
     struct segment *segment;
-    struct tl *tl;
 };
 
 /******************************************
@@ -124,6 +131,8 @@ encrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
     br_aes_x86ni_ctr_keys ctx;
     br_gcm_context gc;
 
+    RHO_TRACE_ENTER();
+
     br_aes_x86ni_ctr_init(&ctx, key, RHO_C_ARRAY_SIZE(default_key));
     br_gcm_init(&gc, &ctx.vtable, br_ghash_pclmul);
     br_gcm_reset(&gc, iv, IV_SIZE); 
@@ -131,6 +140,8 @@ encrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
     br_gcm_flip(&gc);
     br_gcm_run(&gc, 1, data, data_len); /* encrypts in-place */
     br_gcm_get_tag(&gc, tag);
+
+    RHO_TRACE_EXIT();
 }
 
 /* decrypt fd to priv_mem */
@@ -141,6 +152,8 @@ decrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
     br_aes_x86ni_ctr_keys ctx;
     br_gcm_context gc;
 
+    RHO_TRACE_ENTER();
+
     br_aes_x86ni_ctr_init(&ctx, key, RHO_C_ARRAY_SIZE(default_key));
     br_gcm_init(&gc, &ctx.vtable, br_ghash_pclmul);
     br_gcm_reset(&gc, iv, IV_SIZE); 
@@ -148,6 +161,8 @@ decrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
     br_gcm_flip(&gc);
     br_gcm_run(&gc, 0, data, data_len); /* encrypts in-place */
     br_gcm_get_tag(&gc, tag);
+
+    RHO_TRACE_EXIT();
 }
 
 /******************************************
@@ -300,6 +315,8 @@ tl_create(void)
 {
     struct tl *tl = NULL;
 
+    RHO_TRACE_ENTER();
+
     /* this memory will be untrusted */
     tl = mmap(NULL, sizeof(struct tl), PROT_READ|PROT_WRITE,
         MAP_ANONYMOUS|MAP_SHARED, -1, 0);    
@@ -309,6 +326,7 @@ tl_create(void)
     tl->ticket_number = 0;
     tl->turn = 0;
 
+    RHO_TRACE_EXIT();
     return (tl);
 }
 
@@ -324,13 +342,14 @@ tl_destroy(struct tl *tl)
 }
 #endif
 
-static void
+static int
 tl_lock(struct tl *tl)
 {
     int my_turn;
 
     my_turn = rho_atomic_fetch_inc(&tl->ticket_number);
     while (my_turn != tl->turn) { /* spin */ ; }
+    return (my_turn);
 }
 
 static void
@@ -348,6 +367,8 @@ segment_create(const char *name, size_t size)
 {
     struct segment *seg = NULL;
 
+    RHO_TRACE_ENTER();
+
     seg = rhoL_zalloc(sizeof(*seg));
 
     seg->name = rhoL_strdup(name);
@@ -361,9 +382,15 @@ segment_create(const char *name, size_t size)
     seg->priv_mem = mmap(NULL, size, PROT_READ|PROT_WRITE,
             MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
 
+    seg->tl = tl_create();
+
     rho_rand_bytes(seg->iv, IV_SIZE);
     memcpy(seg->key, default_key, 32);
 
+    encrypt(seg->priv_mem, seg->size, seg->key, seg->iv, seg->tag);
+    memcpy(seg->pub_mem, seg->priv_mem, seg->size);
+
+    RHO_TRACE_EXIT();
     return (seg);
 }
 
@@ -393,21 +420,29 @@ segment_map_in(struct segment *seg)
 {
     uint8_t actual_tag[TAG_SIZE] = {0};
 
+    RHO_TRACE_ENTER();
+
     memcpy(seg->priv_mem, seg->pub_mem, seg->size);
     decrypt(seg->priv_mem, seg->size, seg->key, seg->iv, actual_tag);
 
     if (!rho_mem_equal(seg->tag, actual_tag, TAG_SIZE))
         rho_warn("on segment \"%s\"map in, tag does not match trusted tag",
                 seg->name);
+
+    RHO_TRACE_EXIT();
 }
 
 /* encrypt private memory to file */
 static void
 segment_map_out(struct segment *seg)
 {
+    RHO_TRACE_ENTER();
+
     rho_rand_bytes(seg->iv, IV_SIZE);
     encrypt(seg->priv_mem, seg->size, seg->key, seg->iv, seg->tag);
     memcpy(seg->pub_mem, seg->priv_mem, seg->size);
+
+    RHO_TRACE_EXIT();
 }
 
 
@@ -415,25 +450,29 @@ segment_map_out(struct segment *seg)
  * SERIALIZE/DESERIALIZE HELPERS
  ******************************************/
 static void
-ad_pack(int turn, void *iv, void *tag, void *ad)
+pack_segment_ad(const struct segment *seg, void *ad)
 {
-    int32_t turn_be;
+    int32_t turn_be = htobe32(seg->turn);
 
-    turn_be = htobe32(turn);
-    memcpy(ad, &turn_be, sizeof(turn_be));
-    memcpy(ad + sizeof(turn_be), iv, IV_SIZE);
-    memcpy(ad + sizeof(turn_be) + IV_SIZE, tag, TAG_SIZE);
+    RHO_TRACE_ENTER();
+
+    memcpy(ad,              &turn_be, sizeof(turn_be));
+    memcpy(ad + AD_KEY_POS, seg->key, KEY_SIZE);
+    memcpy(ad + AD_IV_POS,  seg->iv,  IV_SIZE);
+    memcpy(ad + AD_TAG_POS, seg->tag, TAG_SIZE);
+
+    RHO_TRACE_EXIT();
 }
 
 static void
-ad_unpack(const void *ad, int *turn, void *iv, void *tag)
+unpack_segment_ad(const void *ad, struct segment *seg)
 {
-    int8_t turn_be = 0;
+    RHO_TRACE_ENTER();
 
-    turn_be = *((int32_t *)ad);
-    *turn = be32toh(turn_be);
-    memcpy(iv,ad + sizeof(turn_be), IV_SIZE);
-    memcpy(tag, ad + sizeof(turn_be) + IV_SIZE, TAG_SIZE);
+    memcpy(seg->iv,  ad + AD_IV_POS,  IV_SIZE);
+    memcpy(seg->tag, ad + AD_TAG_POS, TAG_SIZE);
+
+    RHO_TRACE_EXIT();
 }
 
 /******************************************
@@ -444,9 +483,12 @@ secmem_create(const char *url)
 {
     struct secmem *sm = NULL;
 
+    RHO_TRACE_ENTER();
+
     sm = rhoL_zalloc(sizeof(*sm));
-    sm->tl = tl_create();
     sm->client = tcad_connect(url);
+
+    RHO_TRACE_EXIT();
 
     return (sm);
 }
@@ -456,9 +498,13 @@ secmem_create_segment(struct secmem *sm, const char *name, size_t size)
 {
     uint8_t ad[AD_SIZE] = {0};
 
+    RHO_TRACE_ENTER();
+
     sm->segment = segment_create(name, size);
-    ad_pack(sm->tl->turn, sm->segment->iv, sm->segment->tag, ad);
+    pack_segment_ad(sm->segment, ad);
     tcad_create_entry(sm->client, sm->segment->name, ad, AD_SIZE); 
+
+    RHO_TRACE_EXIT();
 }
 
 static void
@@ -466,44 +512,46 @@ secmem_lock(struct secmem *sm)
 {
     uint8_t ad[AD_SIZE] = {0};
     size_t ad_size = 0;
-    int ret_turn = 0;
-    uint8_t ret_iv[IV_SIZE] = {0};
-    uint8_t ret_tag[TAG_SIZE] = {0};
-
+    struct segment *seg = sm->segment;
     TIMER_DECL(timer);
 
-    tl_lock(sm->tl);
+    RHO_TRACE_ENTER();
+
+    seg->turn = tl_lock(seg->tl);
 
 timer_start(&timer);
 
-    tcad_cmp_and_get(sm->client, sm->segment->name, sm->tl->turn, ad, &ad_size);
-    ad_unpack(ad, &ret_turn, ret_iv, ret_tag);
-
-    memcpy(sm->segment->iv, ret_iv, IV_SIZE);
-    memcpy(sm->segment->tag, ret_tag, TAG_SIZE);
-
-    segment_map_in(sm->segment);
+    tcad_cmp_and_get(sm->client, seg->name, seg->turn, ad, &ad_size);
+    unpack_segment_ad(ad, seg);
+    segment_map_in(seg);
 
 timer_stop(&timer);
     fprintf(stderr, "time for map in: %f secs\n", timer_get_elapsed(&timer));
+
+    RHO_TRACE_EXIT();
 }
 
 static void
 secmem_unlock(struct secmem *sm)
 { 
     uint8_t ad[AD_SIZE] = {0};
+    struct segment *seg = sm->segment;
     TIMER_DECL(timer);
 
-timer_start(&timer);
-    segment_map_out(sm->segment);
+    RHO_TRACE_ENTER();
 
-    ad_pack(sm->tl->turn, sm->segment->iv, sm->segment->tag, ad);
-    tcad_inc_and_set(sm->client, sm->segment->name, ad, AD_SIZE);
+timer_start(&timer);
+
+    segment_map_out(seg);
+    pack_segment_ad(seg, ad);
+    tcad_inc_and_set(sm->client, seg->name, ad, sizeof(ad));
 
 timer_stop(&timer);
     fprintf(stderr, "time for map out: %f secs\n", timer_get_elapsed(&timer));
 
-    tl_unlock(sm->tl);
+    tl_unlock(seg->tl);
+
+    RHO_TRACE_EXIT();
 }
 
 static void

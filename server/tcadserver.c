@@ -28,29 +28,37 @@ struct tcad_server {
     uint8_t srv_udspath[108];
 };
 
+struct tcad_entry {
+    char    te_name[TCAD_MAX_NAME_SIZE];
+    int     te_counter; 
+    void    *te_data;
+    size_t  te_data_len;
+    int     te_refcnt;
+    RHO_RB_ENTRY(tcad_entry) te_entry;
+};
+
+RHO_RB_HEAD(tcad_entry_tree, tcad_entry);
+
+struct tcad_fdtable {
+    struct rho_bitmap *ft_map;   /* bitmap of which fd's have been allocated */
+    struct tcad_entry **ft_openentries; /* array of pointers to open entrys; */
+};
+
 struct tcad_client {
     RHO_LIST_ENTRY(tcad_client) cli_next_client;
     struct rpc_agent *cli_agent;
+    struct tcad_fdtable *cli_fdtab;
     uint64_t cli_id;
 };
 
 /* 
- * defines struct tcad_client_list; 
+ * defines: struct tcad_client_list; 
  * (head of list of clients)
  */
 RHO_LIST_HEAD(tcad_client_list, tcad_client); 
 
 typedef void (*tcad_opcall)(struct tcad_client *client);
 
-struct tcad_entry {
-    char    te_name[TCAD_MAX_NAME_SIZE];
-    int     te_counter; 
-    void    *te_data;
-    size_t  te_data_len;
-    RHO_RB_ENTRY(tcad_entry) te_entry;
-};
-
-RHO_RB_HEAD(tcad_entry_tree, tcad_entry);
 
 /**************************************
  * FORWARD DECLARATIONS
@@ -62,19 +70,34 @@ RHO_RB_PROTOTYPE_STATIC(tcad_entry_tree, tcad_entry, te_name, tcad_entry_cmp);
 static struct tcad_entry * tcad_entry_create(const char *name, void *data,
         size_t data_len);
 
-#if 0
 static void tcad_entry_destroy(struct tcad_entry *entry);
-#endif
 
 static void tcad_create_entry_proxy(struct tcad_client *client);
+static void tcad_destroy_entry_proxy(struct tcad_client *client);
 static void tcad_cmp_and_get_proxy(struct tcad_client *client);
 static void tcad_inc_and_set_proxy(struct tcad_client *client);
 
+static void tcad_fork_proxy(struct tcad_client *client);
+static void tcad_child_attach_proxy(struct tcad_client *client);
+static void tcad_new_fdtable_proxy(struct tcad_client *client);
+
+static struct tcad_fdtable * tcad_fdtable_create(void);
+static struct tcad_fdtable * tcad_fdtable_copy(
+        const struct tcad_fdtable *fdtab);
+static void tcad_fdtable_destroy(struct tcad_fdtable *fdtab);
+static void tcad_fdtable_expand(struct tcad_fdtable *fdtab);
+static int tcad_fdtable_fdalloc(struct tcad_fdtable *fdtab);
+static int tcad_fdtable_setopenentry(struct tcad_fdtable *fdtab,
+        struct tcad_entry *entry);
+
 static void tcad_client_add(struct tcad_client *client);
+static struct tcad_client * tcad_client_find(uint64_t id);
 
 static struct tcad_client * tcad_client_alloc(void);
 static struct tcad_client * tcad_client_create(struct rho_sock *sock);
 static void tcad_client_destroy(struct tcad_client *client);
+static struct tcad_client * tcad_client_fork(struct tcad_client *parent);
+static void tcad_client_splice(struct tcad_client *a, struct tcad_client *b);
 
 static void tcad_client_dispatch_call(struct tcad_client *client);
 static void tcad_client_cb(struct rho_event *event, int what,
@@ -102,12 +125,19 @@ struct rho_log *tcad_log = NULL;
 struct tcad_client_list tcad_clients = 
         RHO_LIST_HEAD_INITIALIZER(tcad_clients);
 
-struct tcad_entry_tree tcad_entry_tree_root = RHO_RB_INITIALIZER(&tcad_entry_tree_root);
+struct tcad_entry_tree tcad_entry_tree_root = 
+        RHO_RB_INITIALIZER(&tcad_entry_tree_root);
 
 static tcad_opcall tcad_opcalls[] = {
     [TCAD_OP_CREATE_ENTRY]  = tcad_create_entry_proxy,
+    [TCAD_OP_DESTROY_ENTRY] = tcad_destroy_entry_proxy,
     [TCAD_OP_CMP_AND_GET]   = tcad_cmp_and_get_proxy,
     [TCAD_OP_INC_AND_SET]   = tcad_inc_and_set_proxy,
+
+    /* fork/exec */
+    [TCAD_OP_FORK]           = tcad_fork_proxy,
+    [TCAD_OP_CHILD_ATTACH]   = tcad_child_attach_proxy,
+    [TCAD_OP_NEW_FDTABLE]    = tcad_new_fdtable_proxy,
 };
 
 /**************************************
@@ -168,7 +198,6 @@ tcad_entry_create(const char *name, void *data, size_t data_len)
     return (entry);
 }
 
-#if 0
 static void
 tcad_entry_destroy(struct tcad_entry *entry)
 {
@@ -179,7 +208,6 @@ tcad_entry_destroy(struct tcad_entry *entry)
 
     RHO_TRACE_EXIT();
 }
-#endif
 
 /**************************************
  * RPC HANDLERS
@@ -202,6 +230,7 @@ tcad_create_entry_proxy(struct tcad_client *client)
     int error = 0;
     struct rpc_agent *agent = client->cli_agent;
     struct rho_buf *buf = agent->ra_bodybuf;
+    struct tcad_fdtable *fdtab = client->cli_fdtab;
     uint32_t name_len;
     char name[TCAD_MAX_NAME_SIZE] = { 0 };
     uint32_t data_len;
@@ -252,7 +281,9 @@ tcad_create_entry_proxy(struct tcad_client *client)
         goto done;
     }
 
+    /* TODO: need to add fd to fdtable */
     entry = tcad_entry_create(name, data, data_len);
+    tcad_fdtable_setopenentry(fdtab, entry);
     RHO_RB_INSERT(tcad_entry_tree, &tcad_entry_tree_root, entry);
     error = 0;
 
@@ -268,6 +299,75 @@ done:
         rho_log_errno_debug(tcad_log, error,
                 "id=0x%"PRIx64" create_entry(name=\"%s\", data_len=%zu) -> counter=%zu",
                 client->cli_id, name, data_len, entry->te_counter);
+    }
+    
+    RHO_TRACE_EXIT();
+    return;
+}
+
+/**
+ * request:
+ *  uint32_t name_len
+ *  var      name
+ *
+ * response:
+ *  successs or failure
+ */
+static void
+tcad_destroy_entry_proxy(struct tcad_client *client)
+{
+    int error = 0;
+    struct rpc_agent *agent = client->cli_agent;
+    struct rho_buf *buf = agent->ra_bodybuf;
+    uint32_t name_len;
+    char name[TCAD_MAX_NAME_SIZE] = { 0 };
+    struct tcad_entry *entry = NULL;
+
+    RHO_TRACE_ENTER();
+
+    /* name */
+    error = rho_buf_readu32be(buf, &name_len);
+    if (error != 0) {
+        error = EPROTO;
+        goto done;
+    }
+
+    if (name_len >= TCAD_MAX_NAME_SIZE) {
+        error = EPROTO;
+        goto done;
+    }
+
+    if (rho_buf_read(buf, name, name_len) != name_len) {
+        error = EPROTO;
+        goto done;
+    }
+
+    /* check entry exists */
+    entry = tcad_entry_tree_find(name);
+    if (entry != NULL) {
+        error = EEXIST;
+        goto done;
+    }
+
+    /* TODO: need to remove fd from fdtable */
+    entry->te_refcnt--;
+    if (entry->te_refcnt == 0) {
+        RHO_RB_REMOVE(tcad_entry_tree, &tcad_entry_tree_root, entry);
+        tcad_entry_destroy(entry);
+    }
+
+    error = 0;
+
+done:
+    rpc_agent_new_msg(agent, error);
+    if (error) {
+        rho_log_errno_debug(tcad_log, error, "id=0x%"PRIx64" destroy_entry()\n");
+    } else {
+        rpc_agent_set_bodylen(agent, 4);
+        rho_buf_writeu32be(buf, entry->te_counter);
+        rho_log_errno_debug(tcad_log, error,
+                "id=0x%"PRIx64" destroy_entry(name=\"%s\")",
+                client->cli_id, name);
     }
     
     RHO_TRACE_EXIT();
@@ -447,6 +547,249 @@ done:
 }
 
 /**************************************
+ * FORK/EXEC RPCs
+ **************************************/
+
+/*
+ * RPC invoked by parent.
+ * Create a tcad_cilent state for child, and return the child's id.
+ */
+static void
+tcad_fork_proxy(struct tcad_client *client)
+{
+    int error = 0;
+    struct rpc_agent *agent = client->cli_agent;
+    struct rho_buf *buf = agent->ra_bodybuf;
+    struct tcad_client *child = NULL;
+    uint64_t id = 0;
+
+    RHO_TRACE_ENTER();
+
+    child = tcad_client_fork(client);
+    tcad_client_add(child);
+    id = child->cli_id;
+
+    rpc_agent_new_msg(agent, error);
+    rpc_agent_set_bodylen(agent, 8);
+    rho_buf_writeu64be(buf, id);
+
+    rho_log_errno_debug(tcad_log, error, "id=0x%"PRIx64" fork() -> 0x%"PRIx64,
+        client->cli_id, id);
+
+    RHO_TRACE_EXIT();
+}
+
+/*
+ * RPC invoked by child.
+ * 
+ * Find the tcad_client that parent created for the child 
+ * when the parent invokded the fork RPC.
+ */
+static void
+tcad_child_attach_proxy(struct tcad_client *client)
+{
+    int error = 0;
+    struct rpc_agent *agent = client->cli_agent;
+    struct rho_buf *buf = agent->ra_bodybuf;
+    uint64_t id;
+    struct tcad_client *attachee = NULL;;
+
+    RHO_TRACE_ENTER();
+
+    error = rho_buf_readu64be(buf, &id);
+    if (error == -1) {
+        /* 
+         * TODO: we might want to replace EPROTO with EREMOTEIO,
+         * which, I think, is a non-POSIX errno value that Linux uses
+         */
+        error = EPROTO;
+        goto done;
+    }
+
+    attachee = tcad_client_find(id);
+    if (attachee == NULL) {
+        /* XXX: there might be a more specific errno value for this scenario */
+        error = EINVAL;
+        goto done;
+    }
+
+    tcad_client_splice(client, attachee);
+    
+done:
+    rpc_agent_new_msg(agent, error);
+
+    rho_log_errno_debug(tcad_log, error, "id=0x%"PRIx64" child_attach()",
+        client->cli_id);
+
+    RHO_TRACE_EXIT();
+    return;
+}
+
+static void
+tcad_new_fdtable_proxy(struct tcad_client *client)
+{
+    struct rpc_agent *agent = client->cli_agent;
+
+    RHO_TRACE_ENTER();
+
+    if (client->cli_fdtab != NULL)
+        tcad_fdtable_destroy(client->cli_fdtab);
+
+    client->cli_fdtab = tcad_fdtable_create();
+
+    rpc_agent_new_msg(agent, 0);
+
+    rho_log_errno_debug(tcad_log, 0, "id=0x%"PRIx64" new_fdtable()",
+        client->cli_id);
+
+    RHO_TRACE_EXIT();
+    return;
+}
+
+/**************************************
+ * FDTABLE
+ **************************************/
+
+static struct tcad_fdtable *
+tcad_fdtable_create(void)
+{
+    struct tcad_fdtable *fdtab = NULL;
+
+    RHO_TRACE_ENTER();
+
+    fdtab = rhoL_zalloc(sizeof(*fdtab));
+    fdtab->ft_map = rho_bitmap_create(true, 20);
+    fdtab->ft_openentries = rhoL_mallocarray(20,
+            sizeof(struct tcad_entry *), 0);
+
+    RHO_TRACE_EXIT();
+    return (fdtab);
+}
+
+static void
+tcad_fdtable_expand(struct tcad_fdtable *fdtab)
+{
+    size_t newmaxbits = 0;
+    struct rho_bitmap *map = fdtab->ft_map;
+
+    RHO_TRACE_ENTER();
+    
+    /* TODO: check for overflow; also, check that this actually
+     * expands, since the range of size_t is greater than int
+     */
+    newmaxbits = rho_bitmap_size(map) + 32;
+    rho_bitmap_resize(map, newmaxbits);
+    fdtab->ft_openentries = rhoL_reallocarray(fdtab->ft_openentries,
+            newmaxbits, sizeof(struct tcad_entry), 0);
+
+    RHO_TRACE_EXIT();
+}
+
+static struct tcad_fdtable *
+tcad_fdtable_copy(const struct tcad_fdtable *fdtab)
+{
+    struct tcad_fdtable *newp = NULL;
+    struct tcad_entry *entry = NULL;
+    size_t fd = 0;
+    int bitval = 0;
+    size_t n = 0;
+
+    RHO_TRACE_ENTER();
+
+    newp = rhoL_zalloc(sizeof(*newp));
+    newp->ft_map = rho_bitmap_copy(fdtab->ft_map);
+
+    n = rho_bitmap_size(fdtab->ft_map);
+    newp->ft_openentries = rhoL_mallocarray(n, sizeof(struct tcad_entry *), 0);
+
+    RHO_BITMAP_FOREACH(fd, bitval, fdtab->ft_map) {
+        if (bitval == 0)
+            continue;
+        entry = fdtab->ft_openentries[fd];
+        entry->te_refcnt++;
+        newp->ft_openentries[fd] = entry;
+    }
+
+    RHO_TRACE_EXIT();
+    return (newp);
+}
+
+static void
+tcad_fdtable_destroy(struct tcad_fdtable *fdtab)
+{
+    size_t fd = 0;
+    int bitval = 0;
+    struct tcad_entry *entry = NULL;
+
+    RHO_TRACE_ENTER();
+
+    RHO_BITMAP_FOREACH(fd, bitval, fdtab->ft_map) {
+        if (bitval == 0)
+            continue;
+        entry = fdtab->ft_openentries[fd];
+        entry->te_refcnt--;
+        if (entry->te_refcnt == 0) {
+            RHO_RB_REMOVE(tcad_entry_tree, &tcad_entry_tree_root, entry);
+            tcad_entry_destroy(entry);
+        }
+    }
+
+    rhoL_free(fdtab->ft_openentries);
+    rho_bitmap_destroy(fdtab->ft_map);
+    rhoL_free(fdtab);
+
+    RHO_TRACE_EXIT();
+    return;
+}
+
+/*
+ * Allocate a file descriptor for the client.
+ */
+static int
+tcad_fdtable_fdalloc(struct tcad_fdtable *fdtab)
+{
+    int fd = 0;
+    size_t oldmaxbits = 0;
+    struct rho_bitmap *map = fdtab->ft_map;
+
+    RHO_TRACE_ENTER();
+
+    /* TODO: you might want some upper limit on how many files a client can
+     * have open
+     */
+    fd = rho_bitmap_ffc(map);
+    if (fd == -1) {
+        oldmaxbits = rho_bitmap_size(map);
+        tcad_fdtable_expand(fdtab);
+        fd = oldmaxbits;
+    }
+
+    rho_bitmap_set(fdtab->ft_map, fd);
+
+    RHO_TRACE_EXIT("fd=%d", fd);
+    return (fd);
+}
+
+/*
+ * Create and allocate a file descriptor for the
+ * client that refers to it.
+ */
+static int
+tcad_fdtable_setopenentry(struct tcad_fdtable *fdtab, struct tcad_entry *entry)
+{
+    int fd = 0;
+
+    RHO_TRACE_ENTER();
+
+    fd = tcad_fdtable_fdalloc(fdtab);
+    fdtab->ft_openentries[fd] = entry;
+
+    RHO_TRACE_EXIT("fd=%d", fd);
+    return (fd);
+}
+
+
+/**************************************
  * CLIENT
  **************************************/
 static void
@@ -473,6 +816,25 @@ again:
 
     RHO_TRACE_EXIT();
     return;
+}
+
+static struct tcad_client *
+tcad_client_find(uint64_t id)
+{
+    struct tcad_client *iter = NULL;
+
+    RHO_TRACE_ENTER();
+
+    RHO_LIST_FOREACH(iter, &tcad_clients, cli_next_client) {
+        if (iter->cli_id == id)
+            goto done;
+    }
+
+    iter = NULL;
+
+done:
+    RHO_TRACE_EXIT();
+    return (iter);
 }
 
 static struct tcad_client *
@@ -518,10 +880,48 @@ tcad_client_destroy(struct tcad_client *client)
     RHO_TRACE_ENTER();
 
     rpc_agent_destroy(client->cli_agent);
+    if (client->cli_fdtab != NULL)
+        tcad_fdtable_destroy(client->cli_fdtab);
     rhoL_free(client);
 
     RHO_TRACE_EXIT();
 }
+
+static struct tcad_client *
+tcad_client_fork(struct tcad_client *parent)
+{
+    struct tcad_client *client = NULL;
+
+    RHO_TRACE_ENTER();
+
+    client = tcad_client_alloc();
+    client->cli_fdtab = tcad_fdtable_copy(parent->cli_fdtab);
+
+    RHO_TRACE_EXIT();
+    return (client);
+}
+
+/*
+ * a is from the child connecing
+ * b is from the parent's fork
+ *
+ * a gets b's filedescriptor table
+ * b is deleted
+ */
+static void
+tcad_client_splice(struct tcad_client *a, struct tcad_client *b)
+{
+    RHO_TRACE_ENTER();
+
+    a->cli_fdtab = b->cli_fdtab;
+    b->cli_fdtab = NULL;
+
+    RHO_LIST_REMOVE(b, cli_next_client);
+    tcad_client_destroy(b);
+
+    RHO_TRACE_EXIT();
+    return;
+};
 
 static void
 tcad_client_dispatch_call(struct tcad_client *client)

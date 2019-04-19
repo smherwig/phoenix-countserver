@@ -75,7 +75,6 @@ struct segment {
     int     turn;
 };
 
-
 struct tcad_client {
     struct rpc_agent   *cli_agent;
 };
@@ -168,6 +167,33 @@ decrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
 /******************************************
  * TCAD Client
  ******************************************/
+static int
+tcad_new_fdtable(struct tcad_client *client)
+{
+    int error = 0;
+    struct rpc_agent *agent = client->cli_agent;
+    struct rpc_hdr *hdr = &agent->ra_hdr;
+
+    RHO_TRACE_ENTER();
+
+    rpc_agent_new_msg(agent, TCAD_OP_NEW_FDTABLE);
+
+    /* make request */
+    error = rpc_agent_request(agent);
+    if (error != 0) {
+        /* RPC/transport error */
+        goto done;
+    }
+
+    if (hdr->rh_code != 0) {
+        /* method error */
+        goto done;
+    }
+
+done:
+    RHO_TRACE_EXIT();
+    return (error);
+}
 
 static struct tcad_client *
 tcad_connect(const char *url)
@@ -182,6 +208,8 @@ tcad_connect(const char *url)
 
     client = rhoL_zalloc(sizeof(*client));
     client->cli_agent = rpc_agent_create(sock, NULL);
+
+    tcad_new_fdtable(client);
 
     RHO_TRACE_EXIT();
     return (client);
@@ -221,6 +249,18 @@ tcad_create_entry(struct tcad_client *client, const char *name, void *data,
 done:
     RHO_TRACE_EXIT();
     return (error);
+}
+
+static int
+tcad_destroy_entry(struct tcad_client *client, const char *name)
+{
+    RHO_TRACE_ENTER();
+
+    (void)client;
+    (void)name;
+
+    RHO_TRACE_EXIT();
+    return (0);
 }
 
 static int
@@ -295,7 +335,6 @@ done:
     return (error);
 }
 
-#if 0
 static int
 tcad_disconnect(struct tcad_client *client)
 {
@@ -304,7 +343,6 @@ tcad_disconnect(struct tcad_client *client)
     RHO_TRACE_EXIT();
     return (0);
 }
-#endif
 
 /******************************************
  * Ticket-Lock
@@ -330,17 +368,19 @@ tl_create(void)
     return (tl);
 }
 
-#if 0
 static void
 tl_destroy(struct tl *tl)
 {
     int error = 0;    
+
+    RHO_TRACE_ENTER();
     
     error = munmap(tl, sizeof(*tl));
     if (error == -1)
         rho_errno_warn(errno, "munmap");
+
+    RHO_TRACE_EXIT();
 }
-#endif
 
 static int
 tl_lock(struct tl *tl)
@@ -394,11 +434,12 @@ segment_create(const char *name, size_t size)
     return (seg);
 }
 
-#if 0
 static void
 segment_destroy(struct segment *seg)
 {
     int error = 0;
+
+    RHO_TRACE_ENTER();
 
     rhoL_free(seg->name);
 
@@ -410,9 +451,12 @@ segment_destroy(struct segment *seg)
     if (error == -1)
         rho_errno_warn(errno, "munmap");
 
+    tl_destroy(seg->tl);
+
     rhoL_free(seg);
+
+    RHO_TRACE_EXIT();
 }
-#endif
 
 /* decrypt file into private memory */
 static void
@@ -444,7 +488,6 @@ segment_map_out(struct segment *seg)
 
     RHO_TRACE_EXIT();
 }
-
 
 /******************************************
  * SERIALIZE/DESERIALIZE HELPERS
@@ -478,7 +521,7 @@ unpack_segment_ad(const void *ad, struct segment *seg)
 /******************************************
  * SECMEM
  ******************************************/
-struct secmem *
+static struct secmem *
 secmem_create(const char *url)
 {
     struct secmem *sm = NULL;
@@ -494,6 +537,17 @@ secmem_create(const char *url)
 }
 
 static void
+secmem_destroy(struct secmem *sm)
+{
+    RHO_TRACE_ENTER();
+    
+    tcad_disconnect(sm->client); 
+    rhoL_free(sm);
+
+    RHO_TRACE_EXIT();
+}
+
+static void
 secmem_create_segment(struct secmem *sm, const char *name, size_t size)
 {
     uint8_t ad[AD_SIZE] = {0};
@@ -503,6 +557,20 @@ secmem_create_segment(struct secmem *sm, const char *name, size_t size)
     sm->segment = segment_create(name, size);
     pack_segment_ad(sm->segment, ad);
     tcad_create_entry(sm->client, sm->segment->name, ad, AD_SIZE); 
+
+    RHO_TRACE_EXIT();
+}
+
+static void
+secmem_destroy_segment(struct secmem *sm)
+{
+    struct segment *seg = sm->segment;
+
+    RHO_TRACE_ENTER();
+
+    tcad_destroy_entry(sm->client, seg->name);
+    segment_destroy(seg);
+    sm->segment = NULL;
 
     RHO_TRACE_EXIT();
 }
@@ -588,7 +656,8 @@ main(int argc, char *argv[])
         random_sleep();
     }
 
-    //secmem_destroy(sm);
+    secmem_destroy_segment(sm);
+    secmem_destroy(sm);
 
     return (0);
 }

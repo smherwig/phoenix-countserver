@@ -788,7 +788,6 @@ tcad_fdtable_setopenentry(struct tcad_fdtable *fdtab, struct tcad_entry *entry)
     return (fd);
 }
 
-
 /**************************************
  * CLIENT
  **************************************/

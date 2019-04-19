@@ -122,7 +122,6 @@ random_sleep(void)
  * CIPHER
  ******************************************/
 
-/* encrypt priv_mem to fd */
 static void
 encrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
         uint8_t *tag)
@@ -143,7 +142,6 @@ encrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
     RHO_TRACE_EXIT();
 }
 
-/* decrypt fd to priv_mem */
 static void
 decrypt(uint8_t *data, size_t data_len, const uint8_t *key, const uint8_t *iv,
         uint8_t *tag)

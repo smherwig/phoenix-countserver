@@ -1,3 +1,5 @@
+testclient
+==========
 The testclient is a mock, example implementation of a secure shared memory
 protocol for use with Intel SGX.
 
@@ -122,8 +124,11 @@ the trusted counter).
 Additionally, there is likely an optimization that involves implementing the
 ticket-lock with futexes, so as to avoid long spin loops.
 
+
+serverless
+==========
 If you have an honest-but-curious model (and thus assume the integrity of
-untrusted memory), you would do the same algorithm with the following
+untrusted memory), you would use the same algorithm with the following
 changes:
 
     1. use aes_ctr instead of aes_gcm

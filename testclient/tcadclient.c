@@ -21,8 +21,7 @@
 
 #include <tcad.h>
 
-
-#define ITERATIONS 10
+#define NUM_TRIALS 10
 
 #define COUNTER_SIZE 4
 #define KEY_SIZE 16
@@ -46,6 +45,11 @@ static uint8_t default_key[] = {
     0x59, 0x5a, 0x5b, 0x5c,
     0x5d, 0x5e, 0x5f, 0x60,
 };
+
+/* for benchmarking */
+int trial = 0;
+double lock_times[NUM_TRIALS] = { 0 };
+double unlock_times[NUM_TRIALS] = { 0 };
 
 struct timer {
     clock_t start;
@@ -88,6 +92,7 @@ struct secmem {
 /******************************************
  * TIMER
  ******************************************/
+
 static inline void
 timer_start(struct timer *timer)
 {
@@ -105,6 +110,52 @@ static inline double
 timer_get_elapsed(struct timer *timer)
 {
     return ((double)(timer->stop - timer->start) / CLOCKS_PER_SEC);
+}
+
+/******************************************
+ * BENCHMARK HELPERS
+ ******************************************/
+/* 
+ * computes the 30% trimmed mean (bottom 30% and top 30% of
+ * results are removed, and the mean is calculated from the middle
+ * 40%)
+ */
+
+static int
+double_cmp(const void *a, const void *b)
+{
+    double da = *((double *)a);
+    double db = *((double *)b);
+
+    if (da > db)
+        return (1);
+    else if (da == db)
+        return (0);
+    else
+        return (-1);
+}
+
+static double
+trimmed_mean(double *trials, size_t trial_size)
+{
+    int i = 0;
+    int lo = 0;
+    int hi = 0;
+    double sum = 0;
+
+    qsort(trials, trial_size, sizeof(double), double_cmp);
+
+    lo = (int)(0.3 * trial_size);
+    hi = (int)(0.7 * trial_size);
+
+    printf("middle 40%%\n");
+    for (i = lo; i < hi; i++) {
+        printf("%f\n", trials[i]);
+        sum += trials[i];
+    }
+
+    sum /= 4.0;
+    return (sum);
 }
 
 /******************************************
@@ -638,6 +689,7 @@ timer_start(&timer);
     error = segment_map_in(seg);
 
 timer_stop(&timer);
+    lock_times[trial] = timer_get_elapsed(&timer);
     fprintf(stderr, "time for map in: %f secs\n", timer_get_elapsed(&timer));
 
 done:
@@ -663,6 +715,7 @@ timer_start(&timer);
     error = tcad_inc_and_set(sm->client, seg->tcad_fd, ad, sizeof(ad));
 
 timer_stop(&timer);
+    unlock_times[trial] = timer_get_elapsed(&timer);
     fprintf(stderr, "time for map out: %f secs\n", timer_get_elapsed(&timer));
 
     tl_unlock(seg->tl);
@@ -674,7 +727,7 @@ timer_stop(&timer);
 static void
 usage(int exit_code)
 {
-    fprintf(stderr, "tcadclient SERVER_URL SEGMENT_NAME\n");
+    fprintf(stderr, "tcadclient SERVER_URL SEGMENT_NAME SEGMENT_SIZE\n");
     exit(exit_code);
 }
 
@@ -683,29 +736,31 @@ usage(int exit_code)
  *
  * argv[1] = server url
  * argv[2] = name of segment to create
+ * argv[3] = segment size (in bytes)
  ******************************************/
 int
 main(int argc, char *argv[])
 {
     int error = 0;
     struct secmem *sm = NULL;
-    int i = 0;
+    uint32_t seg_size = 0;
 
-    if (argc != 3)
+    if (argc != 4)
         usage(1);
 
+    seg_size = rho_str_touint32(argv[3], 10);
     sm = secmem_create(argv[1]);
-    
-    error = secmem_create_segment(sm, argv[2], 4096);
+    error = secmem_create_segment(sm, argv[2], seg_size);
     if (error != 0)
         rho_errno_die(error, "secmem_create_segment");
 
-    for (i = 0; i < ITERATIONS; i++) {
+    for (trial = 0; trial < NUM_TRIALS; trial++) {
         error = secmem_lock(sm);
         if (error != 0)
             rho_errno_die(error, "secmem_lock");
 
-        rho_hexdump(sm->segment->priv_mem, 16, "priv_mem on lock (i=%d)", i);
+        rho_hexdump(sm->segment->priv_mem, 16, "priv_mem on lock (trial=%d)",
+                trial);
         memcpy(sm->segment->priv_mem + 8, "AAAAAAAA", 8);
         
         error = secmem_unlock(sm);
@@ -717,6 +772,10 @@ main(int argc, char *argv[])
 
     secmem_destroy_segment(sm);
     secmem_destroy(sm);
+
+    printf("trimmed mean:\n");
+    printf("    lock: %f\n", trimmed_mean(lock_times, NUM_TRIALS));
+    printf("  unlock: %f\n", trimmed_mean(unlock_times, NUM_TRIALS));
 
     return (0);
 }

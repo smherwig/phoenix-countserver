@@ -73,6 +73,7 @@ struct segment {
     uint8_t tag[16];        /* trusted/server */
     struct tl *tl;          /* untrusted */
     int     turn;
+    int     tcad_fd;
 };
 
 struct tcad_client {
@@ -216,7 +217,7 @@ tcad_connect(const char *url)
 /* returns 0 on success, or an errno value on failure */
 static int
 tcad_create_entry(struct tcad_client *client, const char *name, void *data,
-        size_t data_len)
+        size_t data_len, int *fd)
 {
     int error = 0;
     struct rpc_agent *agent = client->cli_agent;
@@ -235,12 +236,51 @@ tcad_create_entry(struct tcad_client *client, const char *name, void *data,
     error = rpc_agent_request(agent);
     if (error != 0) {
         /* RPC/transport error (EPROTO) */
+        rho_warn("RPC error");
         goto done;
     }
 
     if (hdr->rh_code != 0) {
         /* method error */
         error = hdr->rh_code;
+        rho_errno_warn(error, "RPC returned an error");
+        goto done;
+    }
+
+    rho_buf_readu32be(buf, (uint32_t *)&fd);
+
+done:
+    RHO_TRACE_EXIT();
+    return (error);
+}
+
+static int
+tcad_destroy_entry(struct tcad_client *client, int fd)
+{
+    int error = 0;
+    struct rpc_agent *agent = client->cli_agent;
+    struct rho_buf *buf = agent->ra_bodybuf;
+    struct rpc_hdr *hdr = &agent->ra_hdr;
+
+    RHO_TRACE_ENTER();
+
+    /* build request */
+    rpc_agent_new_msg(agent, TCAD_OP_DESTROY_ENTRY);
+    rho_buf_writeu32be(buf, fd);
+    rpc_agent_autoset_bodylen(agent);
+
+    /* make request */
+    error = rpc_agent_request(agent);
+    if (error != 0) {
+        /* RPC/transport error */
+        rho_warn("RPC error");
+        goto done;
+    }
+
+    if (hdr->rh_code != 0) {
+        /* method error */
+        error = hdr->rh_code;
+        rho_errno_warn(error, "RPC returned an error");
         goto done;
     }
 
@@ -250,20 +290,8 @@ done:
 }
 
 static int
-tcad_destroy_entry(struct tcad_client *client, const char *name)
-{
-    RHO_TRACE_ENTER();
-
-    (void)client;
-    (void)name;
-
-    RHO_TRACE_EXIT();
-    return (0);
-}
-
-static int
-tcad_cmp_and_get(struct tcad_client *client, const char *name,
-        int expected_count, void *data, size_t *data_len)
+tcad_cmp_and_get(struct tcad_client *client, int fd, int expected_count,
+        void *data, size_t *data_len)
 {
     int error = 0;
     struct rpc_agent *agent = client->cli_agent;
@@ -274,7 +302,7 @@ tcad_cmp_and_get(struct tcad_client *client, const char *name,
 
     /* build request */
     rpc_agent_new_msg(agent, TCAD_OP_CMP_AND_GET);
-    rho_buf_write_u32size_str(buf, name);
+    rho_buf_writeu32be(buf, fd);
     rho_buf_write32be(buf, expected_count); 
     rpc_agent_autoset_bodylen(agent);
 
@@ -282,11 +310,14 @@ tcad_cmp_and_get(struct tcad_client *client, const char *name,
     error = rpc_agent_request(agent);
     if (error != 0) {
         /* RPC/transport error */
+        rho_warn("RPC error");
         goto done;
     }
 
     if (hdr->rh_code != 0) {
         /* method error */
+        error = hdr->rh_code;
+        rho_errno_warn(error, "RPC returned an error");
         goto done;
     }
 
@@ -298,7 +329,7 @@ done:
 }
 
 static int
-tcad_inc_and_set(struct tcad_client *client, const char *name, void *data,
+tcad_inc_and_set(struct tcad_client *client, int fd, void *data,
         size_t data_len)
 {
     int error = 0;
@@ -310,7 +341,7 @@ tcad_inc_and_set(struct tcad_client *client, const char *name, void *data,
 
     /* build request */
     rpc_agent_new_msg(agent, TCAD_OP_INC_AND_SET);
-    rho_buf_write_u32size_str(buf, name);
+    rho_buf_writeu32be(buf, fd);
     rho_buf_write_u32size_blob(buf, data, data_len);
     rpc_agent_autoset_bodylen(agent);
 
@@ -318,11 +349,14 @@ tcad_inc_and_set(struct tcad_client *client, const char *name, void *data,
     error = rpc_agent_request(agent);
     if (error != 0) {
         /* RPC/transport error */
+        rho_warn("RPC error");
         goto done;
     }
 
     if (hdr->rh_code != 0) {
         /* method error */
+        error = hdr->rh_code;
+        rho_errno_warn(error, "RPC returned an error");
         goto done;
     }
 
@@ -457,9 +491,10 @@ segment_destroy(struct segment *seg)
 }
 
 /* decrypt file into private memory */
-static void
+static int
 segment_map_in(struct segment *seg)
 {
+    int error = 0;
     uint8_t actual_tag[TAG_SIZE] = {0};
 
     RHO_TRACE_ENTER();
@@ -467,11 +502,14 @@ segment_map_in(struct segment *seg)
     memcpy(seg->priv_mem, seg->pub_mem, seg->size);
     decrypt(seg->priv_mem, seg->size, seg->key, seg->iv, actual_tag);
 
-    if (!rho_mem_equal(seg->tag, actual_tag, TAG_SIZE))
+    if (!rho_mem_equal(seg->tag, actual_tag, TAG_SIZE)) {
         rho_warn("on segment \"%s\"map in, tag does not match trusted tag",
                 seg->name);
+        error = EBADE;  /* invalid exchange */
+    }
 
     RHO_TRACE_EXIT();
+    return (error);
 }
 
 /* encrypt private memory to file */
@@ -545,18 +583,21 @@ secmem_destroy(struct secmem *sm)
     RHO_TRACE_EXIT();
 }
 
-static void
+static int
 secmem_create_segment(struct secmem *sm, const char *name, size_t size)
 {
+    int error = 0;
     uint8_t ad[AD_SIZE] = {0};
 
     RHO_TRACE_ENTER();
 
     sm->segment = segment_create(name, size);
     pack_segment_ad(sm->segment, ad);
-    tcad_create_entry(sm->client, sm->segment->name, ad, AD_SIZE); 
+    error = tcad_create_entry(sm->client, sm->segment->name, ad, AD_SIZE,
+            &sm->segment->tcad_fd);
 
     RHO_TRACE_EXIT();
+    return (error);
 }
 
 static void
@@ -566,16 +607,17 @@ secmem_destroy_segment(struct secmem *sm)
 
     RHO_TRACE_ENTER();
 
-    tcad_destroy_entry(sm->client, seg->name);
+    tcad_destroy_entry(sm->client, seg->tcad_fd);
     segment_destroy(seg);
     sm->segment = NULL;
 
     RHO_TRACE_EXIT();
 }
 
-static void
+static int
 secmem_lock(struct secmem *sm)
 {
+    int error = 0;
     uint8_t ad[AD_SIZE] = {0};
     size_t ad_size = 0;
     struct segment *seg = sm->segment;
@@ -587,19 +629,26 @@ secmem_lock(struct secmem *sm)
 
 timer_start(&timer);
 
-    tcad_cmp_and_get(sm->client, seg->name, seg->turn, ad, &ad_size);
+    error = tcad_cmp_and_get(sm->client, seg->tcad_fd, seg->turn, ad,
+            &ad_size);
+    if (error != 0)
+        goto done;
+
     unpack_segment_ad(ad, seg);
-    segment_map_in(seg);
+    error = segment_map_in(seg);
 
 timer_stop(&timer);
     fprintf(stderr, "time for map in: %f secs\n", timer_get_elapsed(&timer));
 
+done:
     RHO_TRACE_EXIT();
+    return (error);
 }
 
-static void
+static int
 secmem_unlock(struct secmem *sm)
 { 
+    int error = 0;
     uint8_t ad[AD_SIZE] = {0};
     struct segment *seg = sm->segment;
     TIMER_DECL(timer);
@@ -610,7 +659,8 @@ timer_start(&timer);
 
     segment_map_out(seg);
     pack_segment_ad(seg, ad);
-    tcad_inc_and_set(sm->client, seg->name, ad, sizeof(ad));
+
+    error = tcad_inc_and_set(sm->client, seg->tcad_fd, ad, sizeof(ad));
 
 timer_stop(&timer);
     fprintf(stderr, "time for map out: %f secs\n", timer_get_elapsed(&timer));
@@ -618,6 +668,7 @@ timer_stop(&timer);
     tl_unlock(seg->tl);
 
     RHO_TRACE_EXIT();
+    return (error);
 }
 
 static void
@@ -636,6 +687,7 @@ usage(int exit_code)
 int
 main(int argc, char *argv[])
 {
+    int error = 0;
     struct secmem *sm = NULL;
     int i = 0;
 
@@ -643,13 +695,22 @@ main(int argc, char *argv[])
         usage(1);
 
     sm = secmem_create(argv[1]);
-    secmem_create_segment(sm, argv[2], 4096);
+    
+    error = secmem_create_segment(sm, argv[2], 4096);
+    if (error != 0)
+        rho_errno_die(error, "secmem_create_segment");
 
     for (i = 0; i < ITERATIONS; i++) {
-        secmem_lock(sm);
-        rho_hexdump(sm->segment->priv_mem, 16, "parent priv_mem on lock (i=%d)", i);
+        error = secmem_lock(sm);
+        if (error != 0)
+            rho_errno_die(error, "secmem_lock");
+
+        rho_hexdump(sm->segment->priv_mem, 16, "priv_mem on lock (i=%d)", i);
         memcpy(sm->segment->priv_mem + 8, "AAAAAAAA", 8);
-        secmem_unlock(sm);
+        
+        error = secmem_unlock(sm);
+        if (error != 0)
+            rho_errno_die(error, "secmem_unlock");
         //rho_hexdump(sm->priv_mem, 16, "parent priv_mem on unlock (i=%d)", i);
         random_sleep();
     }

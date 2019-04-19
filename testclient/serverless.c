@@ -18,7 +18,7 @@
 
 #include <bearssl/bearssl.h>
 
-#define ITERATIONS 10
+#define NUM_TRIALS 10
 
 #define KEY_SIZE 16
 #define IV_SIZE 12
@@ -33,6 +33,11 @@ static uint8_t default_key[] = {
     0x59, 0x5a, 0x5b, 0x5c,
     0x5d, 0x5e, 0x5f, 0x60,
 };
+
+/* for benchmarking */
+int trial = 0;
+double lock_times[NUM_TRIALS] = { 0 };
+double unlock_times[NUM_TRIALS] = { 0 };
 
 struct timer {
     clock_t start;
@@ -82,6 +87,49 @@ static inline double
 timer_get_elapsed(struct timer *timer)
 {
     return ((double)(timer->stop - timer->start) / CLOCKS_PER_SEC);
+}
+
+/******************************************
+ * BENCHMARK HELPERS
+ ******************************************/
+/* 
+ * computes the 30% trimmed mean (bottom 30% and top 30% of
+ * results are removed, and the mean is calculated from the middle
+ * 40%)
+ */
+
+static int
+double_cmp(const void *a, const void *b)
+{
+    double da = *((double *)a);
+    double db = *((double *)b);
+
+    if (da > db)
+        return (1);
+    else if (da == db)
+        return (0);
+    else
+        return (-1);
+}
+
+static double
+trimmed_mean(double *trials, size_t trial_size)
+{
+    int i = 0;
+    int lo = 0;
+    int hi = 0;
+    double sum = 0;
+
+    qsort(trials, trial_size, sizeof(double), double_cmp);
+
+    lo = (int)(0.3 * trial_size);
+    hi = (int)(0.7 * trial_size);
+
+    for (i = lo; i < hi; i++)
+        sum += trials[i];
+
+    sum /= 4.0;
+    return (sum);
 }
 
 /******************************************
@@ -293,6 +341,7 @@ segment_lock(struct segment *seg)
 timer_start(&timer);
     segment_map_in(seg);
 timer_stop(&timer);
+    lock_times[trial] = timer_get_elapsed(&timer);
     fprintf(stderr, "time for map in: %f secs\n", timer_get_elapsed(&timer));
 
     RHO_TRACE_EXIT();
@@ -308,6 +357,7 @@ segment_unlock(struct segment *seg)
 timer_start(&timer);
     segment_map_out(seg);
 timer_stop(&timer);
+    unlock_times[trial] = timer_get_elapsed(&timer);
     fprintf(stderr, "time for map out: %f secs\n", timer_get_elapsed(&timer));
 
     tlad_unlock(seg->tlad);
@@ -318,7 +368,7 @@ timer_stop(&timer);
 static void
 usage(int exit_code)
 {
-    fprintf(stderr, "serverless SEGMENT_NAME\n");
+    fprintf(stderr, "serverless SEGMENT_NAME SEGMENT_SIZE\n");
     exit(exit_code);
 }
 
@@ -326,21 +376,23 @@ usage(int exit_code)
  * Example Program
  *
  * argv[1] = name of segment to create
+ * argv[2] = size of segment (in bytes)
  ******************************************/
 int
 main(int argc, char *argv[])
 {
     struct segment *seg = NULL;
-    int i = 0;
+    uint32_t seg_size = 0;
 
-    if (argc != 2)
+    if (argc != 3)
         usage(1);
 
-    seg = segment_create(argv[1], 4096);
+    seg_size = rho_str_touint32(argv[2], 10);
+    seg = segment_create(argv[1], seg_size);
 
-    for (i = 0; i < ITERATIONS; i++) {
+    for (trial = 0; trial < NUM_TRIALS; trial++) {
         segment_lock(seg);
-        rho_hexdump(seg->priv_mem, 16, "priv_mem on lock (i=%d)", i);
+        rho_hexdump(seg->priv_mem, 16, "priv_mem on lock (trial=%d)", trial);
         memcpy(seg->priv_mem + 8, "AAAAAAAA", 8);
         segment_unlock(seg);
         //rho_hexdump(sm->priv_mem, 16, "parent priv_mem on unlock (i=%d)", i);
@@ -348,6 +400,10 @@ main(int argc, char *argv[])
     }
 
     segment_destroy(seg);
+
+    printf("trimmed mean:\n");
+    printf("    lock: %f\n", trimmed_mean(lock_times, NUM_TRIALS));
+    printf("  unlock: %f\n", trimmed_mean(unlock_times, NUM_TRIALS));
 
     return (0);
 }

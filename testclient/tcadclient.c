@@ -148,11 +148,8 @@ trimmed_mean(double *trials, size_t trial_size)
     lo = (int)(0.3 * trial_size);
     hi = (int)(0.7 * trial_size);
 
-    printf("middle 40%%\n");
-    for (i = lo; i < hi; i++) {
-        printf("%f\n", trials[i]);
+    for (i = lo; i < hi; i++)
         sum += trials[i];
-    }
 
     sum /= 4.0;
     return (sum);

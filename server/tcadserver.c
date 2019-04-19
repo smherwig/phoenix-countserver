@@ -368,7 +368,7 @@ done:
     rpc_agent_new_msg(agent, error);
     rho_log_errno_debug(tcad_log, error,
             "id=0x%"PRIx64" cmp_and_get(fd=%d, counter=%d)\n",
-            fd, expected_counter);
+            client->cli_id, fd, expected_counter);
     if (!error) {
         rpc_agent_set_bodylen(agent, 4 + entry->te_data_size);
         rho_buf_writeu32be(buf, entry->te_data_size);

@@ -213,6 +213,7 @@ tcad_connect(const char *url)
     return (client);
 }
 
+/* returns 0 on success, or an errno value on failure */
 static int
 tcad_create_entry(struct tcad_client *client, const char *name, void *data,
         size_t data_len)
@@ -233,16 +234,15 @@ tcad_create_entry(struct tcad_client *client, const char *name, void *data,
     /* make request */
     error = rpc_agent_request(agent);
     if (error != 0) {
-        /* RPC/transport error */
+        /* RPC/transport error (EPROTO) */
         goto done;
     }
 
     if (hdr->rh_code != 0) {
         /* method error */
+        error = hdr->rh_code;
         goto done;
     }
-
-    /* body is initial counter value (0) */
 
 done:
     RHO_TRACE_EXIT();

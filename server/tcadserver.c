@@ -194,6 +194,7 @@ tcad_entry_create(const char *name, void *data, size_t data_size)
 
     entry->te_data_size = data_size;
     entry->te_data= data;
+    entry->te_refcnt = 1;
 
     RHO_TRACE_EXIT();
     return (entry);
